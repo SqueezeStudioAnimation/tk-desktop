@@ -1236,7 +1236,6 @@ class DesktopWindow(SystrayWindow):
             # We need to cache all environments because we don't know which one the user will require.
             toolkit_manager.caching_policy = ToolkitManager.CACHE_FULL
             toolkit_manager.plugin_id = "basic.desktop"
-            toolkit_manager.allow_config_overrides = False
             toolkit_manager.base_configuration = "sgtk:descriptor:app_store?name=tk-config-basic"
             toolkit_manager.bundle_cache_fallback_paths.extend(
                 engine.sgtk.bundle_cache_fallback_paths
