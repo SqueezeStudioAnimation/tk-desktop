@@ -22,6 +22,48 @@ class DesktopEngine(Engine):
         # Now continue with the standard initialization
         Engine.__init__(self, tk, *args, **kwargs)
 
+        self._host_info = {"name": "Desktop", "version": "unknown"}
+
+    @property
+    def host_info(self):
+        """
+        :returns: A dictionary with information about the application hosting this engine.
+
+        Note that the version field is initially set to unknown, it gets updated at a later
+        stage on execution of the `DesktopEngineSiteImplementation.run` method.
+
+        The returned dictionary is of the following form on success where the first set
+        of digits refers to the 'Desktop App' version and the second set of digits to the
+        `tk-framework-desktopstartup` version:
+
+            {
+                "name": "Desktop",
+                "version": "v1.4.3 / v1.4.16",
+            }
+
+        The returned dictionary is of following form until it gets updated by the
+        `DesktopEngineSiteImplementation.run`
+
+            {
+                "name": "Desktop",
+                "version: "unknown"
+            }
+        """
+        return self._host_info
+
+    @property
+    def register_toggle_debug_command(self):
+        """
+        Indicates that the tk-desktop engine should not receive a toggle debug
+        engine command during engine initialization. The desktop engine provides
+        its own debug logging toggle via the advanced menu provided by the engine's
+        internal module.
+
+        :rtype: bool
+        """
+        return False
+
+
     ############################################################################
     # Engine methods
     def init_engine(self):

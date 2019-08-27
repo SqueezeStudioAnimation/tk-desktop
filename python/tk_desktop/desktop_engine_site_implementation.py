@@ -15,7 +15,6 @@ import sys
 import string
 import collections
 
-from sgtk.platform import Engine
 from distutils.version import LooseVersion
 import sgtk
 from tank_vendor.shotgun_authentication import ShotgunAuthenticator, DefaultsManager
@@ -35,6 +34,7 @@ class DesktopEngineSiteImplementation(object):
 
         self.site_comm = SiteCommunication(engine)
         self.site_comm.proxy_closing.connect(self._on_proxy_closing)
+        self.site_comm.proxy_created.connect(self._on_proxy_created)
 
         self._engine = engine
         self.app_version = None
@@ -51,6 +51,39 @@ class DesktopEngineSiteImplementation(object):
         shotgun_globals.unregister_bg_task_manager(self._task_manager)
         self.site_comm.shut_down()
 
+    def set_global_debug(self, state):
+        """
+        Attempts to tell a project subprocess to set the state of
+        the global debug logging setting. This will never raise
+        an exception, but a warning message will be logged if something
+        causes the RPC call to raise.
+
+        :param bool state: The debug to set.
+        """
+        if self.site_comm.is_connected and "set_global_debug" in self.site_comm.call("list_functions"):
+            try:
+                self.site_comm.call_no_response("set_global_debug", state)
+            except Exception:
+                # This really can't be a debug log call, because we might have just
+                # toggled debug logging off, in which case the message would not be
+                # logged.
+                logger.warning(
+                    "The RPC call to set_global_debug did not succeed. This is likely "
+                    "caused by an older version of the tk-desktop engine being "
+                    "used by the project. This issue can be resolved by updating to "
+                    "the latest version of tk-desktop using the 'tank updates' command."
+                )
+        elif self.site_comm.is_connected:
+            logger.warning(
+                "A connection is active, but the proxy does not support the "
+                "set_global_debug RPC function. The debug log state will not "
+                "be toggled in the project context as a result."
+            )
+        else:
+            logger.debug(
+                "No connection exists to a project subprocess. No debug "
+                "toggling will occur via RPC as a result."
+            )
 
     ###########################################################################
     # panel support (displayed as tabs)
@@ -95,15 +128,16 @@ class DesktopEngineSiteImplementation(object):
             for index in xrange(apps_index):
                 selector = selectors[index]
                 # skip all the commands that fit the current selector
-                while apps_command_index < len(commands): # insert as the last
-                                                          # command in the worst
-                                                          # case
+                # insert as the last command in the worst case
+                while apps_command_index < len(commands):
                     app, name, _ = commands[apps_command_index]
 
                     # only keep skipping commands if the current selector
                     # matches the current command
-                    if (selector["app_instance"] != app or
-                        (selector["name"] != "" and selector["name"] != name)):
+                    if (
+                        selector["app_instance"] != app or
+                        (selector["name"] != "" and selector["name"] != name)
+                    ):
                         break
 
                     apps_command_index += 1
@@ -113,11 +147,10 @@ class DesktopEngineSiteImplementation(object):
             apps_tab_callback = self.desktop_window._register_apps_tab
             commands.insert(apps_command_index, ("", "", apps_tab_callback))
 
-
         # Execute the actual commands.
         # For example, a command could be displaying a panel in order to
         # display it as a tab in the desktop.
-        for (_,_,command_callback) in commands:
+        for (_, _, command_callback) in commands:
             command_callback()
 
     def show_panel(self, panel_id, title, bundle, widget_class,
@@ -186,6 +219,14 @@ class DesktopEngineSiteImplementation(object):
         # Clear the UI, we can't launch anything anymore!
         self.desktop_window.clear_app_uis()
 
+    def _on_proxy_created(self):
+        """
+        Invoked when background process has created proxy
+        """
+        # Clears the project menu so the previous engine's actions
+        # are removed before adding new one
+        self.desktop_window.clear_actions_from_project_menu()
+
     def set_groups(self, groups, show_recents=True):
         self.desktop_window.set_groups(groups, show_recents)
 
@@ -231,6 +272,7 @@ class DesktopEngineSiteImplementation(object):
                 # response back.
                 self.refresh_user_credentials()
                 self.site_comm.call_no_response("trigger_callback", "__commands", name)
+
             action.triggered.connect(action_triggered)
             self.desktop_window.add_to_project_menu(action)
         else:
@@ -299,44 +341,6 @@ class DesktopEngineSiteImplementation(object):
         :param startup_version: Version of the Desktop Startup code. Can be omitted.
         :param startup_descriptor: Descriptor of the Desktop Startup code. Can be omitted.
         """
-        self.app_version = version
-
-        # Startup version will not be set if we have an old installer invoking
-        # this engine.
-        self.startup_version = kwargs.get("startup_version")
-        self.startup_descriptor = kwargs.get("startup_descriptor")
-        server = kwargs.get("server")
-
-        # Log usage statistics about the Shotgun Desktop executable and the desktop startup.
-        sgtk.util.log_user_attribute_metric("tk-framework-desktopstartup", self.startup_version)
-        sgtk.util.log_user_attribute_metric("Shotgun Desktop version", self.app_version)
-        # If a server is passed down from the desktop startup, it means we won't be using the engine-based
-        # websocket server.
-        sgtk.util.log_user_attribute_metric("Engine-Websockets", "no" if server else "yes")
-
-        if self.uses_legacy_authentication():
-            self._migrate_credentials()
-
-        # We need to initialize current login
-        # We know for sure there is a default user, since either the migration was done
-        # or we logged in as an actual user with the new installer.
-        human_user = ShotgunAuthenticator(
-            # We don't want to get the script user, but the human user, so tell the
-            # CoreDefaultsManager manager that we are not interested in the script user. Do not use
-            # the regular shotgun_authentication.DefaultsManager to get this user because it will
-            # not know about proxy information.
-            sgtk.util.CoreDefaultsManager(mask_script_user=True)
-        ).get_default_user()
-        # Cache the user so we can refresh the credentials before launching a background process
-        self._user = human_user
-        # Retrieve the current logged in user information. This will be used when creating
-        # event log entries.
-        self._current_login = self._engine.sgtk.shotgun.find_one(
-            "HumanUser",
-            [["login", "is", human_user.login]],
-            ["id", "login"]
-        )
-
         # Initialize Qt app
         from tank.platform.qt import QtGui
 
@@ -361,11 +365,76 @@ class DesktopEngineSiteImplementation(object):
         QtGui.QFontDatabase.addApplicationFont(":/tk-desktop/fonts/OpenSans-Light.ttf")
 
         # merge in app specific look and feel
-        css_file = os.path.join(self._engine.disk_location, "resources", "desktop_dark.css")
-        f = open(css_file)
-        css = app.styleSheet() + "\n\n" + f.read()
-        f.close()
+        css_file = os.path.join(self._engine.disk_location, "style.qss")
+        with open(css_file) as f:
+            css = app.styleSheet() + "\n\n" + f.read()
         app.setStyleSheet(css)
+
+        # desktop_window needs to import shotgun_authentication globally. However, doing so
+        # can cause a crash when running Shotgun Desktop installer 1.02 code. We used to
+        # not restart Desktop when upgrading the core, which caused the older version of core
+        # to be kept in memory and the newer core to not be used until the app was reloaded.
+        #
+        # Since pre 0.16 cores didn't have a shotgun_authentication module, we
+        # would have crashed if this had been imported at init time. Note that earlier
+        # in this method we forcefully restarted the application if we noticed
+        # that the core was upgraded without restarting. Which means that if we
+        # end up here, it's now because we're in a good state.
+        from . import desktop_window
+        from .console import Console
+
+        # When we instantiate the console, it also instantiates the logging handler that will
+        # route messages from the logger to the console. We're instantiating it here, right after
+        # Qt has been fully initialized, so that we get more entries in that dialog.
+        console = Console()
+
+        self.app_version = version
+
+        # Startup version will not be set if we have an old installer invoking
+        # this engine.
+        self.startup_version = kwargs.get("startup_version")
+        self.startup_descriptor = kwargs.get("startup_descriptor")
+        server = kwargs.get("server")
+
+        try:
+            # Log usage statistics about the Shotgun Desktop executable and the desktop startup.
+            #
+            # First we update `host_info` property so subsequent metrics can benefit
+            # having the updated information. A special case is made for for Desktop
+            # as we do want both versiond but don't want to create another metric field.
+            # We are then combining both versions into single version string.
+            self._engine._host_info["version"] = "%s / %s" % (self.app_version, self.startup_version)
+
+            # Actually log the metric
+            self._engine.log_metric("Launched Software")
+
+        except Exception:
+            logger.exception("Unexpected error logging a metric")
+            # DO NOT raise exception. It's reasonnable to log an error about it but
+            # we don't want to break normal execution for metric related logging.
+
+        if self.uses_legacy_authentication():
+            self._migrate_credentials()
+
+        # We need to initialize current login
+        # We know for sure there is a default user, since either the migration was done
+        # or we logged in as an actual user with the new installer.
+        human_user = ShotgunAuthenticator(
+            # We don't want to get the script user, but the human user, so tell the
+            # CoreDefaultsManager manager that we are not interested in the script user. Do not use
+            # the regular shotgun_authentication.DefaultsManager to get this user because it will
+            # not know about proxy information.
+            sgtk.util.CoreDefaultsManager(mask_script_user=True)
+        ).get_default_user()
+        # Cache the user so we can refresh the credentials before launching a background process
+        self._user = human_user
+        # Retrieve the current logged in user information. This will be used when creating
+        # event log entries.
+        self._current_login = self._engine.sgtk.shotgun.find_one(
+            "HumanUser",
+            [["login", "is", human_user.login]],
+            ["id", "login"]
+        )
 
         # If server is passed down to this method, it means we are running an older version of the
         # desktop startup code, which runs its own browser integration.
@@ -394,20 +463,8 @@ class DesktopEngineSiteImplementation(object):
         if splash is not None:
             splash.hide()
 
-        # desktop_window needs to import shotgun_authentication globally. However, doing so
-        # can cause a crash when running Shotgun Desktop installer 1.02 code. We used to
-        # not restart Desktop when upgrading the core, which caused the older version of core
-        # to be kept in memory and the newer core to not be used until the app was reloaded.
-        #
-        # Since pre 0.16 cores didn't have a shotgun_authentication module, we
-        # would have crashed if this had been imported at init time. Note that earlier
-        # in this method we forcefully restarted the application if we noticed
-        # that the core was upgraded without restarting. Which means that if we
-        # end up here, it's now because we're in a good state.
-        from . import desktop_window
-
         # initialize System Tray
-        self.desktop_window = desktop_window.DesktopWindow()
+        self.desktop_window = desktop_window.DesktopWindow(console)
 
         # We need for the dialog to exist for messages to get to the UI console.
         if kwargs.get("server") is not None:

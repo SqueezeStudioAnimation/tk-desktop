@@ -102,6 +102,15 @@ class DesktopEngineProjectImplementation(object):
         self._project_comm.register_function(self._test_project_locations, "test_project_locations")
         self._project_comm.register_function(self._open_project_locations, "open_project_locations")
         self._project_comm.register_function(self._get_setting, "get_setting")
+        self._project_comm.register_function(self._set_global_debug, "set_global_debug")
+
+    def _set_global_debug(self, state):
+        """
+        Sets the global debug to the given state.
+
+        :param bool state: The debug state to set.
+        """
+        sgtk.LogManager().global_debug = state
 
     def _register_groups(self):
         # get the list of configured groups
@@ -242,9 +251,9 @@ class DesktopEngineProjectImplementation(object):
         # Make the name pretty for the tray and the task manager.
         app.setApplicationName("%s Python" % self._engine.context.project["name"])
         # set default icon
-        python_icon = os.path.realpath(os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "resources", "python_icon.png"))
+        python_icon = os.path.join(
+            self._engine.disk_location, "icon_bg_python.png"
+        )
         app.setWindowIcon(QtGui.QIcon(python_icon))
 
         self.register_qapplication(app)

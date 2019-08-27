@@ -16,8 +16,6 @@ import tempfile
 import subprocess
 import cPickle as pickle
 import pprint
-import itertools
-import urlparse
 import inspect
 from collections import OrderedDict
 
@@ -35,8 +33,6 @@ from sgtk.platform import get_logger
 from .ui import resources_rc # noqa
 from .ui import desktop_window
 
-from .console import Console
-from .console import ConsoleLogHandler
 from .systray import SystrayWindow
 from .about_screen import AboutScreen
 from .no_apps_installed_overlay import NoAppsInstalledOverlay
@@ -50,6 +46,7 @@ from .loading_project_widget import LoadingProjectWidget
 from .browser_integration_user_switch_dialog import BrowserIntegrationUserSwitchDialog
 from .banner_widget import BannerWidget
 
+from .project_menu import ProjectMenu
 from .project_commands_model import ProjectCommandModel
 from .project_commands_model import ProjectCommandProxyModel
 from .project_commands_widget import ProjectCommandDelegate
@@ -73,6 +70,45 @@ ShotgunModel = shotgun_model.ShotgunModel
 log = get_logger(__name__)
 
 
+class ConfigDownloadThread(QtCore.QThread):
+    """
+    Thread whose sole purpose is to download a configuration locally.
+
+    It will emit download_completed or download_failed depending on the download's success
+    or failure.
+
+    Note that the thread can't be interrupted, which means that if a user steps out of a project
+    it will keep downloading. It can't be killed because killing the Qt thread would risk
+    crashing the Python interpreter which could be left in an incoherent state.
+
+    When the application is closed, the threads seems to not only be properly shut down,
+    but they do not cause a crash on exit, most notably Windows.
+    """
+    download_completed = QtCore.Signal(object, object)
+    download_failed = QtCore.Signal(str)
+
+    def __init__(self, parent, config_descriptor, toolkit_manager):
+        """
+        :param parent: Parent of this Qt object
+        :param config_descriptor: Configuration descriptor to cache.
+        :param toolkit_manager: Configuration manager that will be used to bootstrap
+            this configuration.
+        """
+        super(ConfigDownloadThread, self).__init__(parent)
+        self._config_descriptor = config_descriptor
+        self._toolkit_manager = toolkit_manager
+
+    def run(self):
+        """
+        Ensures the configuration is local.
+        """
+        try:
+            self._config_descriptor.ensure_local()
+            self.download_completed.emit(self._config_descriptor, self._toolkit_manager)
+        except Exception as e:
+            self.download_failed.emit(str(e))
+
+
 class DesktopWindow(SystrayWindow):
     """ Dockable window for the Shotgun system tray """
 
@@ -83,13 +119,12 @@ class DesktopWindow(SystrayWindow):
     _CHROME_SUPPORT_URL = "https://support.shotgunsoftware.com/hc/en-us/articles/114094536273"
     _FIREFOX_SUPPORT_URL = "https://support.shotgunsoftware.com/hc/en-us/articles/115000054954"
 
-    def __init__(self, parent=None):
+    def __init__(self, console, parent=None):
         SystrayWindow.__init__(self, parent)
 
         # initialize member variables
         self.current_project = None
         self.__activation_hotkey = None
-        self.__pipeline_configuration_separator = None
         self._settings_manager = settings.UserSettings(sgtk.platform.current_bundle())
 
         self._sync_thread = None
@@ -99,6 +134,7 @@ class DesktopWindow(SystrayWindow):
         # setup the window
         self.ui = desktop_window.Ui_DesktopWindow()
         self.ui.setupUi(self)
+        self._project_menu = ProjectMenu(self)
         self.project_overlay = LoadingProjectWidget(self.ui.project_commands)
         self.install_apps_widget = NoAppsInstalledOverlay(self.ui.project_commands)
         self.setup_project_widget = SetupProject(self.ui.project_commands)
@@ -125,9 +161,7 @@ class DesktopWindow(SystrayWindow):
         connection = engine.get_current_user().create_sg_connection()
 
         # Setup the console
-        self.__console = Console()
-        self.__console_handler = ConsoleLogHandler(self.__console)
-        sgtk.LogManager().initialize_custom_handler(self.__console_handler)
+        self.__console = console
 
         # User menu
         ###########################
@@ -158,6 +192,7 @@ class DesktopWindow(SystrayWindow):
         url_action = self.user_menu.addAction(connection.base_url.split("://")[1])
         self.user_menu.addSeparator()
         advanced_menu = self.user_menu.addMenu("Advanced")
+
         self.user_menu.addAction(self.ui.actionPin_to_Menu)
         self.user_menu.addAction(self.ui.actionKeep_on_Top)
         self.user_menu.addAction(self.ui.actionRefresh_Projects)
@@ -169,6 +204,18 @@ class DesktopWindow(SystrayWindow):
         self.user_menu.addAction(self.ui.actionQuit)
 
         advanced_menu.addAction(self.ui.actionShow_Console)
+
+        # Setup the toggle action for debug logging.
+        self.toggle_debug_action = QtGui.QAction("Toggle Debug Logging", advanced_menu)
+        self.toggle_debug_action.setCheckable(True)
+        self.toggle_debug_action.setChecked(sgtk.LogManager().global_debug)
+        self.toggle_debug_action.toggled.connect(self._debug_toggled)
+
+        debug_user_pref = self.user_preferred_debug_logging
+        if debug_user_pref is not None:
+            self.toggle_debug_action.setChecked(debug_user_pref)
+
+        advanced_menu.addAction(self.toggle_debug_action)
 
         if (
             desktop_server_framework.can_run_server() and
@@ -278,6 +325,48 @@ class DesktopWindow(SystrayWindow):
         # be done only when the dialog is fully initialized.
         self._load_settings()
 
+    def _debug_toggled(self, state):
+        """
+        Toggles global debug logging and stores the given state as an
+        engine level user setting.
+
+        :param bool state: The debug state to set.
+        """
+        self.user_preferred_debug_logging = state
+        sgtk.LogManager().global_debug = state
+        sgtk.platform.current_engine().set_global_debug(state)
+
+    def _get_user_preferred_debug_logging(self):
+        """
+        Gets the user preferred debug logging state from engine-level user
+        settings. If no setting has been stored, a None is returned.
+
+        :rtype: bool or None
+        """
+        return self._settings_manager.retrieve(
+            "debug_logging",
+            None,
+            self._settings_manager.SCOPE_ENGINE,
+        )
+
+    def _set_user_preferred_debug_logging(self, state):
+        """
+        Sets the debug_logging user preference to the given boolean state.
+        The setting is stored at the engine-level scope.
+
+        :param bool state: The debug logging state to store.
+        """
+        self._settings_manager.store(
+            "debug_logging",
+            state,
+            self._settings_manager.SCOPE_ENGINE,
+        )
+
+    user_preferred_debug_logging = property(
+        _get_user_preferred_debug_logging,
+        _set_user_preferred_debug_logging
+    )
+
     def handle_help(self):
         """
         Jumps to the help page of the Shotgun Desktop.
@@ -336,6 +425,17 @@ class DesktopWindow(SystrayWindow):
         # Update the project at the very end so the Python process is kicked off when everything
         # is initialized.
         project_id = self._settings_manager.retrieve("project_id", None, self._settings_manager.SCOPE_SITE)
+        if project_id == 0:
+            # 0 means will be displaying all of the projects
+            try:
+                from sgtk.util.metrics import EventMetric as EventMetric
+                EventMetric.log(EventMetric.GROUP_NAVIGATION,
+                                "Viewed Projects",
+                                bundle=sgtk.platform.current_engine())
+            except:
+                # ignore all errors. ex: using a core that doesn't support metrics
+                pass
+
         self.__set_project_from_id(project_id)
 
     def _save_setting(self, key, value, site_specific):
@@ -678,6 +778,16 @@ class DesktopWindow(SystrayWindow):
         """
         Invoked when all commands found for a project have been registered.
         """
+
+        try:
+            from sgtk.util.metrics import EventMetric as EventMetric
+            EventMetric.log(EventMetric.GROUP_PROJECTS,
+                            "Viewed Project Commands",
+                            bundle=sgtk.platform.current_engine())
+        except:
+            # ignore all errors. ex: using a core that doesn't support metrics
+            pass
+
         if self._project_command_count == 0:
             # Show the UI that indicates no project commands have been configured
             self.install_apps_widget.build_software_entity_config_widget(
@@ -848,7 +958,7 @@ class DesktopWindow(SystrayWindow):
         return self.ui.project_commands
 
     def add_to_project_menu(self, action):
-        self.project_menu.insertAction(self.__pipeline_configuration_separator, action)
+        self._project_menu.add(action)
 
     def add_project_command(
         self, name, button_name, menu_name, icon, command_tooltip, groups, is_menu_default
@@ -904,6 +1014,16 @@ class DesktopWindow(SystrayWindow):
         # remember that we are back at the browser
         self.current_project = None
         self._save_setting("project_id", 0, site_specific=True)
+        try:
+            from sgtk.util.metrics import EventMetric as EventMetric
+            EventMetric.log(
+                EventMetric.GROUP_NAVIGATION,
+                "Viewed Projects",
+                bundle=engine
+            )
+        except:
+            # ignore all errors. ex: using a core that doesn't support metrics
+            pass
 
         # We are switching back to the project list, so need to show the
         # "Refresh Projects" and hide the "Advanced project setup" menu
@@ -934,98 +1054,20 @@ class DesktopWindow(SystrayWindow):
         self.install_apps_widget.hide()
         self.project_overlay.hide()
 
-        # clear the project specific menu
-        self.project_menu = QtGui.QMenu(self)
-        self.project_menu.aboutToShow.connect(self._on_project_menu_about_to_show)
-        self.project_menu.triggered.connect(self._on_project_menu_triggered)
-        self.ui.actionProject_Filesystem_Folder.setVisible(True)
-        self.project_menu.addAction(self.ui.actionProject_Filesystem_Folder)
-        self.ui.project_menu.setMenu(self.project_menu)
-        self.__pipeline_configuration_separator = None
+        self._project_menu.reset()
+
+    def clear_actions_from_project_menu(self):
+        self._project_menu.clear_actions()
 
     def show_update_project_config(self):
         self.update_project_config_widget.show()
         self.project_overlay.hide()
-
-    def __populate_pipeline_configurations_menu(self, pipeline_configurations, selected):
-        """
-        This will populate the menu with all the pipeline configurations.
-
-            - It will only be built if two or more configurations are available.
-            - Primaries goes first, then everything else is alphabetical.
-            - If two primaries have the same name, the lowest id comes first.
-            - If more than two pipelines have the same name, their id is suffixed between paratheses.
-
-        :param list pipeline_configurations: List of pipeline configurations link.
-        :param id selected: Id of the pipeline that is currently selected. The selected pipeline
-            will have a marked checked box next to its name.
-        """
-
-        if len(pipeline_configurations) < 2:
-            log.debug("Less than two pipeline configurations were found, not building menu.")
-            # only one configuration choice
-            return
-
-        log.debug("More than one pipeline configuration was found, building menu.")
-
-        # Add a separator that will be above the pipeline configurations. Context menu actions will go over that.
-        self.__pipeline_configuration_separator = self.project_menu.addSeparator()
-
-        # Build the configuration section header.
-        label = QtGui.QLabel("CONFIGURATION")
-        label.setObjectName("project_menu_configuration_label")
-        action = QtGui.QWidgetAction(self)
-        action.setDefaultWidget(label)
-        self.project_menu.addAction(action)
-
-        # Group every sandboxes by their name and add pipelines one at a time
-        for pc_name, pc_group in itertools.groupby(pipeline_configurations, lambda x: x["name"]):
-            self._add_pipeline_group_to_menu(list(pc_group), selected)
-
-    def _add_pipeline_group_to_menu(self, pc_group, selected):
-        """
-        Adds a group of pipelines to the menu.
-
-        Pipelines are assumed to have the same name.
-
-        :param list pc_group: List of pipeline entities with keys ''id'', ''name'' and ''project''.
-        :param dict selected: Pipeline configuration to select.
-        """
-        for pc in pc_group:
-            parenthesis_arguments = []
-            # If this is a site level configuration, suffix (site) to it.
-            if pc["project"] is None:
-                parenthesis_arguments.append("site")
-
-            # If there are more than one pipeline in the group, we'll suffix the pipeline id.
-            if len(pc_group) > 1:
-                parenthesis_arguments.append("id %d" % pc["id"])
-
-            if parenthesis_arguments:
-                unique_pc_name = "%s (%s)" % (pc["name"], ", ".join(parenthesis_arguments))
-            else:
-                unique_pc_name = pc["name"]
-
-            action = self.project_menu.addAction(unique_pc_name)
-            action.setCheckable(True)
-            action.setProperty("project_configuration_id", pc["id"])
-
-            # If this pipeline is the one that was selected, mark it in the
-            # menu and update the configuration name widget.
-            if selected and selected["id"] == pc["id"]:
-                action.setChecked(True)
-                self.ui.configuration_name.setText(unique_pc_name)
-
-                # If we haven't picked a primary, show the sandbox header.
-                if not self._is_primary_pc(pc):
-                    self.ui.configuration_frame.show()
 
     def __set_project_just_accessed(self, project):
         self._project_model.update_project_accessed_time(project)
 
     def _on_project_selection(self, selected, deselected):
         selected_indexes = selected.indexes()
-
         if len(selected_indexes) == 0:
             return
 
@@ -1035,7 +1077,7 @@ class DesktopWindow(SystrayWindow):
         self.__set_project_from_item(item)
 
     def __set_project_from_id(self, project_id):
-        if id == 0:
+        if project_id == 0:
             return
 
         # find the project in the model
@@ -1074,26 +1116,13 @@ class DesktopWindow(SystrayWindow):
         project = item.data(SgProjectModel.SG_DATA_ROLE)
         self.__launch_app_proxy_for_project(project)
 
-    def _on_project_menu_about_to_show(self):
-        """
-        Called just before the project specific menu is shown to the user.
-        """
-
-        engine = sgtk.platform.current_engine()
-
-        try:
-            # Get the availability of the project locations.
-            has_project_locations = engine.site_comm.call("test_project_locations")
-        except Exception, exception:
-            log.debug("Cannot get the availability of the project locations: %s" % exception)
-            # Assume project locations are not available.
-            has_project_locations = False
-
-        # Show or hide project menu item "Project Filesystem Folder"
-        # based on the availability of the project locations.
-        self.ui.actionProject_Filesystem_Folder.setVisible(has_project_locations)
-
     def _on_project_menu_triggered(self, action):
+        """
+        Called just after user has selected a project menu option or pipeline configuration.
+        The methods acts only on a pipeline configuration choice.
+
+        :param action: a QAction as selected by user.
+        """
         pc_id = action.property("project_configuration_id")
 
         if pc_id is not None:
@@ -1136,18 +1165,30 @@ class DesktopWindow(SystrayWindow):
         :param error: Exception object that was raised during bootstrap.
         :param tb: Traceback of the exception raised during bootstrap.
         """
+        engine = sgtk.platform.current_engine()
         trigger_project_config = False
         # If missing engine init error, we're know we have to setup the project.
         if isinstance(error, sgtk.platform.TankMissingEngineError):
-            message = "Error starting engine\n\n%s" % error.message
+            message = "Error starting engine!\n\n%s" % error.message
             trigger_project_config = True
         # However, this exception type hasn't always existed, so take care of that
         # case also.
         elif isinstance(error, sgtk.platform.TankEngineInitError):
-            message = "Error starting engine\n\n%s" % error.message
+            message = "Error starting engine!\n\n%s" % error.message
             # match directly on the error message until something less fragile can be put in place
             if error.message.startswith("Cannot find an engine instance tk-desktop"):
                 trigger_project_config = True
+        elif isinstance(error, sgtk.bootstrap.TankMissingTankNameError):
+            message = "Error starting engine!\n\n%s\n\n%s" % (
+                error.message.replace("tank_name", "<b>tank_name</b>"),
+                "Visit your "
+                "<b><a style='color: {0}' href='{1}/detail/Project/{2}'>project</a></b> "
+                "page to set the field.".format(
+                    self.project_overlay.ERROR_COLOR,
+                    engine.sgtk.shotgun_url,
+                    self.current_project["id"]
+                )
+            )
         else:
             message = "Error\n\n%s" % error.message
 
@@ -1223,7 +1264,10 @@ class DesktopWindow(SystrayWindow):
                 self._save_setting(setting_name, pipeline_configuration_to_load["id"], site_specific=True)
 
             # Add all the pipeline configurations to the menu.
-            self.__populate_pipeline_configurations_menu(pipeline_configurations, pipeline_configuration_to_load)
+            self._project_menu.populate_pipeline_configurations_menu(
+                pipeline_configurations,
+                pipeline_configuration_to_load
+            )
 
             # If there is no pipeline configuration set for the current project, i.e. there might be
             # site level ones but no project ones, add the Advanced Project Setup menu.
@@ -1250,12 +1294,26 @@ class DesktopWindow(SystrayWindow):
             # Bootstrap into the requested pipeline configuration or using the fallback.
             if pipeline_configuration_to_load is None:
                 toolkit_manager.pipeline_configuration = None
+                # The fallback is always valid, no need to check for a None descriptor.
                 config_descriptor = toolkit_manager.resolve_descriptor(project)
             else:
                 # We've loaded this project before and saved its pipeline configuration id, so
                 # reload the same old one.
+                engine.logger.debug(
+                    "Found a pipeline configuration to load in Shotgun, picking %s.",
+                    pipeline_configuration_to_load
+                )
                 toolkit_manager.pipeline_configuration = pipeline_configuration_to_load["id"]
                 config_descriptor = pipeline_configuration_to_load["descriptor"]
+
+                # The config descriptor can be None if the pipeline configuration hasn't been
+                # configured properly in Shotgun.
+                if not config_descriptor:
+                    raise Exception(
+                        "The pipeline configuration '{name}' (id: {id}) has not been properly "
+                        "configured.".format(**pipeline_configuration_to_load)
+                    )
+
         except Exception as error:
             log.exception(str(error))
             message = ("%s"
@@ -1268,8 +1326,46 @@ class DesktopWindow(SystrayWindow):
         # From this point on, we don't touch the UI anymore.
         self.project_overlay.start_progress()
 
+        if config_descriptor.exists_local():
+            self._start_bg_process(config_descriptor, toolkit_manager)
+        else:
+            self.project_overlay.report_progress(0.00, "Retrieving configuration...")
+            self._current_download_thread = ConfigDownloadThread(
+                self, config_descriptor, toolkit_manager
+            )
+            self._current_download_thread.download_completed.connect(self._on_config_downloaded)
+            self._current_download_thread.download_failed.connect(self._launch_failed)
+            self._current_download_thread.start()
+
+    def _on_config_downloaded(self, config_descriptor, toolkit_manager):
+        """
+        Called when a configuration has been synced locally and is ready to be bootstrapped into.
+
+        :param config_descriptor: Configuration that has been synced locally.
+        :param toolkit_manager: Manager to use for bootstrapping
+        """
+
+        # It is possible that the user jumps in and out of projects that trigger downloads of zip
+        # files, therefore we only want to handle this message if we get it for the latest thread we've
+        # spun up.
+        if self._current_download_thread != self.sender():
+            log.debug("Discarding request for configuration %s that was cancelled.", config_descriptor)
+            return
+
+        self._start_bg_process(config_descriptor, toolkit_manager)
+
+    def _start_bg_process(self, config_descriptor, toolkit_manager):
+        """
+        Starts the background process that Desktop will communicate with.
+
+        :param config_descriptor: Configuration that has been synced locally.
+        :param toolkit_manager: Manager to use for bootstrapping
+        """
+        engine = sgtk.platform.current_engine()
+
         try:
             self._current_pipeline_descriptor = config_descriptor
+
             # Find the interpreter the config wants to use.
             try:
                 path_to_python = config_descriptor.python_interpreter
@@ -1310,7 +1406,8 @@ class DesktopWindow(SystrayWindow):
                 }
             }
             (_, pickle_data_file) = tempfile.mkstemp(suffix='.pkl')
-            pickle.dump(desktop_data, open(pickle_data_file, "wb"))
+            with open(pickle_data_file, "wb") as pickle_data_file_handle:
+                pickle.dump(desktop_data, pickle_data_file_handle)
 
             # update the values on the project updater in case they are needed
             self.update_project_config_widget.set_project_info(
